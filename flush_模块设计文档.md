@@ -102,9 +102,200 @@ PRIMARY KEY (namespace, table_name)
 ### 3.1 核心思路
 
 定时由 **C bgworker 每 1 秒轮询** `iceberg_auto_flush_scheduler()` 驱动。
-INSERT 触发器只做 Phase 1（冻结 delta），AFTER STATEMENT 触发器 + bgworker 消费 Phase 2。
+INSERT 触发器：只写 delta，不触发 flush（全由 bgworker 负责）。
 
-### 3.2 计时机制
+### 3.2 C bgworker 实现
+
+bgworker 是 PG 内置的后台进程框架。PG postmaster 启动时会 fork 一个独立进程，加载指定共享库并调用入口函数。整个过程分为三步：**编写入口函数 → 在 `_PG_init()` 中注册 → 编译进 .so**。
+
+#### 3.2.1 入口函数 — `fdw/bgworker/auto_flush_worker.c`
+
+```c
+#include "postgres.h"
+#include "postmaster/bgworker.h"
+#include "miscadmin.h"
+#include "executor/spi.h"
+#include "access/xact.h"
+#include "utils/snapmgr.h"
+
+int  gsiceberg_bgworker_interval = 1;    // 轮询间隔，默认 1 秒
+char *gsiceberg_bgworker_dbname  = "gv"; // 连接的数据库
+
+PGDLLEXPORT void auto_flush_main(Datum arg)
+{
+    // ① 连接到目标数据库（作为 bootstrap superuser）
+    BackgroundWorkerUnblockSignals();
+    BackgroundWorkerInitializeConnection(
+        gsiceberg_bgworker_dbname,  // 数据库名 "gv"
+        NULL,                        // 用户名（NULL=superuser）
+        0                            // flags
+    );
+
+    for (;;)
+    {
+        CHECK_FOR_INTERRUPTS();  // 响应 PG 关闭信号
+
+        // ② 启动事务（bgworker 中 SPI 需要手动管理事务）
+        SetCurrentStatementStartTimestamp();
+        StartTransactionCommand();
+
+        // ③ 连接 SPI
+        SPI_connect();
+
+        // ④ 设置 active snapshot（bgworker 必需！否则报错：
+        //    "cannot execute SQL without an outer snapshot or portal"）
+        PushActiveSnapshot(GetTransactionSnapshot());
+
+        // ⑤ 调度 Phase 1：扫描 auto_flush 表，满足条件则 freeze delta
+        SPI_execute("SELECT public.iceberg_auto_flush_scheduler()",
+                    false, 0);
+
+        // ⑥ 消费 Phase 2：处理 pending/failed job
+        //    空字符串绕过 STRICT（NULL 会导致函数直接返回 NULL）
+        SPI_execute("SELECT public.iceberg_flush_worker('')",
+                    false, 0);
+
+        // ⑦ 清理
+        PopActiveSnapshot();
+        SPI_finish();
+        CommitTransactionCommand();  // 提交！其他窗口立即可见结果
+
+        // ⑧ 等待下一轮
+        pg_usleep(gsiceberg_bgworker_interval * 1000000L);
+    }
+}
+```
+
+**关键点**：
+
+| 步骤 | 代码 | 为什么必须 |
+|------|------|-----------|
+| ④ PushActiveSnapshot | `PushActiveSnapshot(GetTransactionSnapshot())` | bgworker 没有自动 snapshot，不调用 SPI 报错 |
+| ⑦ CommitTransactionCommand | `CommitTransactionCommand()` | 每次迭代独立事务，其他 psql 窗口可以看到 flush 结果 |
+| ⑥ 空字符串 | `iceberg_flush_worker('')` | 函数声明为 `STRICT`，传 NULL 直接返回不执行 |
+
+#### 3.2.2 注册 — `fdw/hooks/fdw_hooks.c`
+
+在 `_PG_init()` 中调用 `RegisterBackgroundWorker`，告诉 PG postmaster："启动时帮我 fork 一个进程，加载 gsiceberg.so，执行 auto_flush_main"。
+
+```c
+/* fdw/hooks/fdw_hooks.c，在 _PG_init() 函数中 */
+
+if (!IsUnderPostmaster)  // ← 只在 postmaster 中执行，backend 跳过
+{
+    BackgroundWorker worker;
+    memset(&worker, 0, sizeof(worker));
+
+    // bgw_flags: 控制 worker 的行为
+    worker.bgw_flags = BGWORKER_SHMEM_ACCESS          // 可以访问共享内存
+                     | BGWORKER_BACKEND_DATABASE_CONNECTION; // 需要数据库连接
+
+    // bgw_start_time: 什么时候启动
+    worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+    // RecoveryFinished = 等 crash recovery 完成后才启动（安全）
+
+    // bgw_restart_time: 崩溃后多久重启（秒）
+    worker.bgw_restart_time = 10;  // 10 秒后自动重启
+
+    // 指向我们的入口函数
+    snprintf(worker.bgw_library_name,  BGW_MAXLEN, "gsiceberg");
+    snprintf(worker.bgw_function_name, BGW_MAXLEN, "auto_flush_main");
+
+    // bgworker 的显示名称（pg_stat_activity 中可见）
+    snprintf(worker.bgw_name, BGW_MAXLEN, "gsiceberg auto_flush");
+    snprintf(worker.bgw_type, BGW_MAXLEN, "gsiceberg auto_flush");
+
+    worker.bgw_main_arg = (Datum) 0;
+
+    // 注册！PG postmaster 会在启动时 fork 这个 worker
+    RegisterBackgroundWorker(&worker);
+}
+
+// 同时注册 GUC，允许用户调整轮询间隔
+DefineCustomIntVariable("gsiceberg.bgworker_interval",
+    "Auto-flush bgworker poll interval in seconds (default 1).",
+    NULL,
+    &gsiceberg_bgworker_interval,
+    1,           // 默认 1 秒
+    1,           // 最小 1 秒
+    60,          // 最大 60 秒
+    PGC_SIGHUP,  // SIGHUP 即可生效（pg_reload_conf），无需重启
+    0, NULL, NULL, NULL);
+
+DefineCustomStringVariable("gsiceberg.bgworker_dbname",
+    "Database for auto-flush bgworker to connect to.",
+    NULL,
+    &gsiceberg_bgworker_dbname,
+    "gv",             // 默认连接 gv 数据库
+    PGC_POSTMASTER,   // 需要重启 PG 才能切换数据库
+    0, NULL, NULL, NULL);
+```
+
+**注册标志说明**：
+
+| 标志 | 含义 |
+|------|------|
+| `BGWORKER_SHMEM_ACCESS` | worker 需要访问共享内存（用于 PG 内部通信） |
+| `BGWORKER_BACKEND_DATABASE_CONNECTION` | worker 需要连接数据库（能执行 SQL） |
+| `BgWorkerStart_RecoveryFinished` | 等 PG crash recovery 完成后才启动 |
+| `bgw_restart_time = 10` | 如果 worker 崩溃，10 秒后自动重启 |
+
+#### 3.2.3 编译 — `Makefile`
+
+```makefile
+# 将 bgworker 编入 gsiceberg.so
+OBJS += fdw/bgworker/auto_flush_worker.o
+```
+
+#### 3.2.4 启动流程
+
+```
+PG 启动
+  │
+  ├─ postmaster 读取 postgresql.conf
+  │   shared_preload_libraries = 'gsiceberg'
+  │   → 加载 gsiceberg.so
+  │   → 调用 _PG_init()
+  │     → RegisterBackgroundWorker(&worker)   ← 注册 bgworker
+  │     → postmaster 将 worker 加入"待启动列表"
+  │
+  ├─ postmaster 完成 recovery
+  │   → 检查待启动列表
+  │   → fork() 一个新进程
+  │     → 子进程加载 gsiceberg.so
+  │     → 调用 auto_flush_main()
+  │       → BackgroundWorkerInitializeConnection("gv", ...)
+  │       → for(;;) { scheduler + worker + sleep(1) }
+  │
+  └─ 如果 worker 崩溃（SIGSEGV 等）
+      → postmaster 等待 10 秒
+      → 重新 fork，再次调用 auto_flush_main()
+```
+
+#### 3.2.5 验证 bgworker 运行
+
+```sql
+-- 查看 bgworker 进程
+SELECT pid, backend_type, state
+FROM pg_stat_activity
+WHERE backend_type = 'gsiceberg auto_flush';
+
+-- 调整轮询间隔（无需重启）
+ALTER SYSTEM SET gsiceberg.bgworker_interval = 3;
+SELECT pg_reload_conf();
+```
+
+#### 3.2.6 前提条件
+
+`postgresql.conf` 必须配置：
+
+```ini
+shared_preload_libraries = 'gsiceberg'
+```
+
+没有这个配置，`_PG_init()` 只在 backend 进程中执行（不在 postmaster 中），`RegisterBackgroundWorker` 无效，bgworker 不会启动。
+
+### 3.3 计时机制
 
 计时器存储在 `_gsiceberg.tables.last_flush_at`，三种来源：
 
@@ -115,30 +306,19 @@ last_flush_at 被更新:
   └─ flush_jobs.status='completed'        → trg_last_flush_at → 设为 finished_at
 ```
 
-### 3.3 完整调用链路
+### 3.4 完整调用链路
 
 ```
 ═══════════════════════════════════════════════════════════════
-触发路径 1 — INSERT（异步，interval>0 时毫秒级返回）
+触发路径 1 — INSERT（只写 delta，不触发 flush）
 ═══════════════════════════════════════════════════════════════
 INSERT INTO af_test VALUES (...)
   │
   ├─ INSTEAD OF INSERT 触发器 (ROW LEVEL)
   │   ├─ INSERT INTO _gsiceberg._<stem>_delta  ← 写入 delta
-  │   └─ PERFORM _gsiceberg.iceberg_auto_flush_trigger_check()
-  │       │  [02f-auto-flush.sql:23]
-  │       ├─ interval=0? → 每次 INSERT 都触发 Phase 1
-  │       ├─ interval>0? → elapsed >= interval 才触发
-  │       │   elapsed = now() - MAX(finished_at) WHERE status='completed'
-  │       │   找不到 → 回退到 tables.created_at
-  │       ├─ 有 pending/in_progress job? → 跳过（避免重复）
-  │       ├─ delta 行数 < min_rows? → 跳过
-  │       └─ 条件满足:
-  │           async → PERFORM iceberg_flush(table)  ← 只做 Phase 1 freeze
-  │           sync  → PERFORM iceberg_flush_sync(table)  ← Phase 1+2 一步
+  │   └─ PERFORM iceberg_auto_flush_trigger_check() → RETURN（空操作）
   │
-  └─ AFTER INSERT STATEMENT 触发器
-      └─ PERFORM iceberg_flush_worker('')  ← 消费 Phase 2
+  └─ AFTER INSERT STATEMENT 触发器 → RETURN NULL（空操作）
 
 ═══════════════════════════════════════════════════════════════
 触发路径 2 — C bgworker 轮询（每 1 秒，Phase 1+2 分离）
@@ -170,30 +350,254 @@ UPDATE _gsiceberg.tables SET auto_flush_enabled=true
       └─ 关闭: 不处理
 ```
 
-### 3.4 触发方式对比
+### 3.5 触发方式对比
 
 | 触发方式 | 谁触发 | Phase 1 | Phase 2 | 适用场景 |
 |---------|--------|---------|---------|---------|
-| INSERT 触发器 | 每次 INSERT 检查条件 | async=freeze, sync=一步 | AFTER STATEMENT | interval=0 每次触发 |
+| INSERT 触发器 | 只写 delta，不触发 flush | 无 | 无 | — |
 | C bgworker | 每 1 秒轮询 | scheduler→freeze | worker→消费 | interval>0 周期触发 |
 | UPDATE 触发器 | auto_flush_enabled 变化 | freeze+worker | 同步 | 首次开启 |
 
-### 3.5 函数与触发器清单
+### 3.6 核心函数代码详解
+
+#### 3.6.1 Scheduler — `iceberg_auto_flush_scheduler()`
+
+bgworker 每秒调用此函数。扫描所有 auto_flush 表，满足条件则触发 Phase 1。
+
+**文件**：`gsiceberg/sql/02f-auto-flush.sql:193`
+
+```sql
+CREATE OR REPLACE FUNCTION iceberg_auto_flush_scheduler()
+RETURNS TABLE(table_name text, namespace text, job_id bigint, mode text,
+              elapsed_sec int, interval_sec int, reason text)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE
+    rec      RECORD;          -- 当前遍历的表配置
+    elapsed  int;             -- 距上次 flush 的秒数
+    jid      bigint;          -- iceberg_flush() 返回值
+    last_ts  timestamptz;     -- 上次 flush 完成时间
+    delta_n  bigint;          -- delta 表行数
+    obj_stem text;            -- namespace_table 前缀
+    delta_rel text;           -- delta 表全名
+BEGIN
+    -- 遍历所有开启了 auto_flush 的表（interval>0 才有意义）
+    FOR rec IN
+        SELECT t.table_name, t.namespace, t.auto_flush_interval_sec,
+               t.auto_flush_mode, t.auto_flush_min_rows
+        FROM _gsiceberg.tables t
+        WHERE t.auto_flush_enabled = true
+          AND t.auto_flush_interval_sec > 0   -- interval=0 不处理
+    LOOP
+        -- ① 读取计时器（last_flush_at 不被 DELETE 影响）
+        SELECT t.last_flush_at INTO last_ts
+        FROM _gsiceberg.tables t
+        WHERE t.table_name = rec.table_name
+          AND t.namespace = rec.namespace;
+
+        -- ② 计算已过时间
+        IF last_ts IS NOT NULL THEN
+            elapsed := extract(epoch FROM now() - last_ts)::int;
+        ELSE
+            -- 首次使用，以表创建时间为起点
+            elapsed := extract(epoch FROM now() - (
+                SELECT t.created_at FROM _gsiceberg.tables t
+                WHERE t.table_name = rec.table_name))::int;
+        END IF;
+
+        -- ③ 判断是否到达触发周期
+        IF elapsed >= rec.auto_flush_interval_sec THEN
+
+            -- ④ 防止重复触发（已有 pending/in_progress job 则跳过）
+            IF NOT EXISTS (
+                SELECT 1 FROM _gsiceberg.flush_jobs j2
+                WHERE j2.table_name = rec.table_name
+                  AND j2.status IN ('pending', 'in_progress')
+            ) THEN
+
+                -- ⑤ 检查 delta 行数是否达到阈值
+                obj_stem  := rec.namespace || '_' || rec.table_name;
+                delta_rel := format('_gsiceberg._%s_delta', obj_stem);
+                EXECUTE format('SELECT count(*) FROM %s', delta_rel) INTO delta_n;
+
+                IF delta_n >= rec.auto_flush_min_rows THEN
+
+                    -- ⑥ 触发 Phase 1（仅 freeze，立即返回 job_id）
+                    IF rec.auto_flush_mode = 'sync' THEN
+                        PERFORM public.iceberg_flush_sync(rec.table_name);
+                        -- sync 模式返回 bool，fake job_id=0 用于上报
+                        table_name  := rec.table_name;
+                        namespace   := rec.namespace;
+                        job_id      := 0;
+                        mode        := 'sync';
+                        interval_sec := rec.auto_flush_interval_sec;
+                        elapsed_sec := elapsed;
+                        reason      := format('elapsed=%ss >= interval=%ss (sync)',
+                                            elapsed, rec.auto_flush_interval_sec);
+                        RETURN NEXT;
+                    ELSE
+                        -- async 模式：只做 Phase 1，Phase 2 由 worker 处理
+                        SELECT public.iceberg_flush(rec.table_name) INTO jid;
+                        IF jid IS NOT NULL AND jid > 0 THEN
+                            table_name  := rec.table_name;
+                            namespace   := rec.namespace;
+                            job_id      := jid;
+                            mode        := rec.auto_flush_mode;
+                            interval_sec := rec.auto_flush_interval_sec;
+                            elapsed_sec := elapsed;
+                            reason      := format('elapsed=%ss >= interval=%ss',
+                                                elapsed, rec.auto_flush_interval_sec);
+                            RETURN NEXT;
+                        END IF;
+                    END IF;
+                END IF;
+            END IF;
+        END IF;
+    END LOOP;
+END;
+$$;
+```
+
+**关键逻辑**：
+- ⑥ 使用 `PERFORM` 而非 `SELECT INTO`（函数返回 void，不需要返回值）
+- `RECORD` 类型用于动态遍历 FOR 循环结果
+- `RETURN NEXT` 将当前行加入返回结果集（SETOF 返回模式）
+- delta 表名动态拼接：`_gsiceberg._<namespace>_<table_name>_delta`
+
+#### 3.6.2 UPDATE 触发器 — `iceberg_auto_flush_on_enable()`
+
+当用户执行 `UPDATE _gsiceberg.tables SET auto_flush_enabled=true` 时触发。
+
+**文件**：`gsiceberg/sql/02f-auto-flush.sql:102`
+
+```sql
+CREATE OR REPLACE FUNCTION _gsiceberg.iceberg_auto_flush_on_enable()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE
+    delta_n   bigint;          -- delta 行数
+    obj_stem  text;            -- namespace_table
+    delta_rel text;            -- delta 表全名
+    jid       bigint;          -- job_id
+BEGIN
+    -- 关闭时不做任何操作
+    IF NEW.auto_flush_enabled = false THEN
+        RETURN NEW;
+    END IF;
+
+    -- 已开启状态下改 interval：只重置计时器，不触发 flush
+    IF OLD.auto_flush_enabled = true THEN
+        -- interval 变化 → 重置计时原点
+        UPDATE _gsiceberg.tables SET last_flush_at = now()
+        WHERE table_name = NEW.table_name;
+        RETURN NEW;
+    END IF;
+
+    -- false→true：首次开启，立即 flush 已有 delta
+    UPDATE _gsiceberg.tables SET last_flush_at = now()
+    WHERE table_name = NEW.table_name;
+
+    obj_stem  := NEW.namespace || '_' || NEW.table_name;
+    delta_rel := format('_gsiceberg._%s_delta', obj_stem);
+
+    -- 安全计数：delta 表可能不存在（刚 mount 还没 INSERT）
+    BEGIN
+        EXECUTE format('SELECT count(*) FROM %s', delta_rel) INTO delta_n;
+    EXCEPTION WHEN OTHERS THEN
+        RETURN NEW;
+    END;
+
+    IF delta_n < NEW.auto_flush_min_rows THEN RETURN NEW; END IF;
+
+    -- 避免重复触发
+    IF EXISTS (SELECT 1 FROM _gsiceberg.flush_jobs
+               WHERE table_name = NEW.table_name
+                 AND status IN ('pending','in_progress')) THEN
+        RETURN NEW;
+    END IF;
+
+    -- 执行完整 flush（不在 INSERT 上下文中，cleanup 安全）
+    IF NEW.auto_flush_mode = 'sync' THEN
+        PERFORM public.iceberg_flush_sync(NEW.table_name);
+    ELSE
+        SELECT public.iceberg_flush(NEW.table_name) INTO jid;
+        IF jid IS NOT NULL AND jid > 0 THEN
+            PERFORM public.iceberg_flush_worker(NEW.table_name);
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+```
+
+**为什么 UPDATE 触发器可以做完整 flush**：它触发于 `_gsiceberg.tables` 而非 `af_test` 视图，cleanup 阶段的 `DROP VIEW af_test` 不会遇到 "active queries" 错误。
+
+#### 3.6.3 计时器同步触发器 — `_update_last_flush_at`
+
+当 `flush_jobs.status` 变为 `completed` 时，自动同步 `tables.last_flush_at`。
+
+**文件**：`gsiceberg/sql/02f-auto-flush.sql:161`
+
+```sql
+-- 触发器函数
+CREATE OR REPLACE FUNCTION _gsiceberg._update_last_flush_at()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+BEGIN
+    UPDATE _gsiceberg.tables SET last_flush_at = NEW.finished_at
+    WHERE table_name = NEW.table_name;
+    RETURN NEW;
+END;
+$$;
+
+-- 触发器定义（条件触发器：仅 status 变为 completed 时触发）
+CREATE TRIGGER trg_last_flush_at
+    AFTER UPDATE OF status ON _gsiceberg.flush_jobs
+    FOR EACH ROW
+    WHEN (NEW.status = 'completed')   -- 条件：只响应 completed
+    EXECUTE FUNCTION _gsiceberg._update_last_flush_at();
+```
+
+**为什么不用 `MAX(finished_at)` 查表**：`DELETE FROM flush_jobs` 会清除历史记录，`MAX(finished_at)` 就找不到了。`last_flush_at` 在 `tables` 表上，不受 DELETE 影响。
+
+#### 3.6.4 DDL：自动添加列
+
+**文件**：`gsiceberg/sql/02f-auto-flush.sql:146`
+
+```sql
+ALTER TABLE _gsiceberg.tables
+    ADD COLUMN IF NOT EXISTS auto_flush_enabled      boolean NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS auto_flush_interval_sec  int    NOT NULL DEFAULT 300,
+    ADD COLUMN IF NOT EXISTS auto_flush_mode          text   NOT NULL DEFAULT 'async',
+    ADD COLUMN IF NOT EXISTS auto_flush_min_rows      int    NOT NULL DEFAULT 1,
+    ADD COLUMN IF NOT EXISTS last_flush_at            timestamptz;
+
+-- CHECK 约束
+DO $$ BEGIN
+    ALTER TABLE _gsiceberg.tables
+        ADD CONSTRAINT auto_flush_mode_check
+        CHECK (auto_flush_mode IN ('async', 'sync'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+ALTER TABLE _gsiceberg.flush_state
+    ADD COLUMN IF NOT EXISTS finished_at timestamptz;
+```
+
+### 3.7 函数与触发器清单
 
 | 名称 | 类型 | 文件:行 | 作用 |
 |------|------|--------|------|
-| `iceberg_auto_flush_trigger_check` | 函数 | 02f:23 | INSERT 行级：检查条件→Phase 1 |
-| `iceberg_auto_flush_after_stmt` | 函数 | 02f:88 | AFTER STATEMENT：消费 Phase 2 |
-| `iceberg_auto_flush_on_enable` | 函数 | 02f:102 | UPDATE 触发器：启用时立即 flush |
-| `iceberg_auto_flush_scheduler` | 函数 | 02f:193 | bgworker 调用：扫描+触发 Phase 1 |
+| `iceberg_auto_flush_trigger_check` | 函数 | 02f:3 | INSERT 行级：空操作（bgworker 负责调度） |
+| `iceberg_auto_flush_after_stmt` | 函数 | 02f:88 | AFTER STATEMENT：空操作（Phase 2 由 bgworker 处理） |
+| `iceberg_auto_flush_on_enable` | 函数 | 02f:102 | UPDATE 触发器：启用/改 interval 逻辑 |
+| `iceberg_auto_flush_scheduler` | 函数 | 02f:193 | bgworker 每 1 秒调用：扫描+触发 Phase 1 |
 | `iceberg_auto_flush_next_sec` | 函数 | 02f:277 | 距下次 flush 秒数 |
 | `_update_last_flush_at` | 函数 | 02f:161 | flush_jobs→completed 时同步 last_flush_at |
 | `auto_flush_on_enable_trg` | 触发器 | 02f:176 | tables 上：AFTER UPDATE OF enabled/interval |
-| `trg_last_flush_at` | 触发器 | 02f:169 | flush_jobs 上：job 完成时更新计时器 |
+| `trg_last_flush_at` | 触发器 | 02f:169 | flush_jobs 上：job 完成时更新计时器（条件触发器） |
 | `<table>_ins_trg` | 触发器 | 02b:185 | 每表：INSTEAD OF INSERT → trigger_check |
-| `<table>_auto_ast` | 触发器 | 02b:208 | 每表：AFTER INSERT STATEMENT → worker |
+| `<table>_auto_ast` | 触发器 | 02b:208 | 每表：AFTER INSERT STATEMENT（空操作） |
 
-### 3.6 时间线示例（interval=5s）
+### 3.7 时间线示例（interval=5s）
 
 ```
 t=0s   UPDATE SET auto_flush_enabled=true, interval=5
@@ -205,8 +609,8 @@ t=1s   INSERT → delta=1行
 t=3s   INSERT → delta=2行
        bgworker: elapsed=3s < 5s → 不触发
 
-t=6s   INSERT → delta=3行（或仅 bgworker 检查）
-       bgworker: elapsed=6s >= 5s → scheduler 触发!
+t=6s   bgworker: elapsed=6s >= 5s → scheduler 触发!
+         → iceberg_flush() → freeze delta 中所有行 → job_id=X
          → iceberg_flush() → freeze 3行 → job_id=X
          → iceberg_flush_worker('') → Phase 2 → completed
          → trg_last_flush_at → last_flush_at = now()
@@ -216,7 +620,7 @@ t=7s   INSERT → delta=1行
        ...循环...
 ```
 
-### 3.7 变量清单
+### 3.8 变量清单
 
 | 变量 | 类型 | 所在函数 | 含义 |
 |------|------|---------|------|
@@ -423,7 +827,125 @@ C bgworker (随 PG 启动，1s 轮询):
   → foreign → flush → train → cleanup → completed
 ```
 
-### 5.2 bgworker 实现
+### 5.2 Worker 函数 — `iceberg_flush_worker()`
+
+bgworker 每秒调用的 Phase 2 消费函数，扫描 `flush_jobs` 处理 pending/failed job。
+
+**文件**：`gsiceberg/sql/02a-lifecycle.sql:159`
+
+```sql
+CREATE OR REPLACE FUNCTION iceberg_flush_worker(table_name text)
+RETURNS int LANGUAGE plpgsql STRICT SECURITY DEFINER
+SET search_path = pg_catalog AS $$
+DECLARE
+    job_id_val   bigint;
+    table_val    text;
+    ok           bool;
+BEGIN
+    -- 权限检查（bgworker 以 superuser 运行，自动通过）
+    PERFORM public.gsiceberg_require_admin();
+
+    -- 重置卡住的 in_progress job（超过 5 分钟的视为僵尸）
+    UPDATE _gsiceberg.flush_jobs
+        SET status = 'pending',
+            retry_count = COALESCE(retry_count, 0) + 1
+        WHERE status = 'in_progress'
+          AND started_at < now() - interval '5 minutes';
+
+    -- Drain 循环：一次调用处理所有 pending job
+    LOOP
+        -- 取一个 job（跳过被其他 worker 锁定的行）
+        SELECT job_id, flush_jobs.table_name INTO job_id_val, table_val
+            FROM _gsiceberg.flush_jobs
+            WHERE status IN ('pending', 'failed')
+              AND COALESCE(retry_count, 0) < 3    -- 最多重试 3 次
+            ORDER BY job_id LIMIT 1
+            FOR UPDATE SKIP LOCKED;               -- 跳过被锁的行
+
+        IF NOT FOUND THEN
+            EXIT;  -- 队列已清空
+        END IF;
+
+        -- 标记为处理中
+        UPDATE _gsiceberg.flush_jobs
+            SET status = 'in_progress'
+            WHERE job_id = job_id_val;
+
+        -- Stage Foreign：处理外部导入文件
+        BEGIN
+            SELECT public.iceberg_flush_stage_foreign(table_val, job_id_val) INTO ok;
+            IF NOT ok THEN RAISE EXCEPTION 'stage_foreign_failed'; END IF;
+        EXCEPTION WHEN OTHERS THEN
+            UPDATE _gsiceberg.flush_jobs
+                SET status = 'failed', retry_count = COALESCE(retry_count, 0) + 1,
+                    error_msg = SQLERRM, finished_at = now()
+                WHERE job_id = job_id_val;
+            RETURN 0;
+        END;
+
+        -- Stage Flush：写 Parquet + 提交 catalog
+        BEGIN
+            SELECT public.iceberg_flush_stage_flush(table_val, job_id_val) INTO ok;
+            IF NOT ok THEN RAISE EXCEPTION 'stage_flush_failed'; END IF;
+        EXCEPTION WHEN OTHERS THEN
+            UPDATE _gsiceberg.flush_jobs SET status = 'failed',
+                retry_count = COALESCE(retry_count, 0) + 1,
+                error_msg = SQLERRM, finished_at = now()
+                WHERE job_id = job_id_val;
+            RETURN 0;
+        END;
+
+        -- Stage Train：索引训练（micro-stage 循环）
+        <<stage_c_loop>>
+        BEGIN
+            LOOP
+                SELECT public.iceberg_flush_stage_train(table_val, job_id_val) INTO ok;
+                IF NOT ok THEN RAISE EXCEPTION 'stage_c_micro_failed'; END IF;
+                -- 检查是否所有 micro-stage 完成
+                IF EXISTS (SELECT 1 FROM _gsiceberg.flush_state
+                           WHERE flush_state.table_name = table_val
+                             AND stage = 'cleanup') THEN
+                    EXIT stage_c_loop;
+                END IF;
+            END LOOP;
+        EXCEPTION WHEN OTHERS THEN
+            UPDATE _gsiceberg.flush_jobs SET status = 'failed',
+                retry_count = COALESCE(retry_count, 0) + 1,
+                error_msg = SQLERRM, finished_at = now()
+                WHERE job_id = job_id_val;
+            RETURN 0;
+        END;
+
+        -- Stage Cleanup：清理 + 重建 VIEW
+        BEGIN
+            SELECT public.iceberg_flush_stage_cleanup(table_val, job_id_val) INTO ok;
+            IF NOT ok THEN RAISE EXCEPTION 'stage_cleanup_failed'; END IF;
+        EXCEPTION WHEN OTHERS THEN
+            UPDATE _gsiceberg.flush_jobs SET status = 'failed',
+                retry_count = COALESCE(retry_count, 0) + 1,
+                error_msg = SQLERRM, finished_at = now()
+                WHERE job_id = job_id_val;
+            RETURN 0;
+        END;
+    END LOOP;
+
+    RETURN 1;
+END;
+$$;
+```
+
+**关键设计**：
+
+| 设计 | 说明 |
+|------|------|
+| `STRICT` | NULL 参数直接返回 NULL。bgworker 传空字符串 `''` 绕过 |
+| `FOR UPDATE SKIP LOCKED` | 防止多个 worker 抢同一个 job |
+| `retry_count < 3` | 失败最多重试 3 次 |
+| `started_at < now() - 5min` | 5 分钟未完成的 job 视为僵尸，重置为 pending |
+| Drain 循环 | 一次调用处理所有 pending job，不留残留 |
+| 每个 Stage 独立 EXCEPTION | 失败只影响当前 Stage，不阻断整个 pipeline |
+
+### 5.3 C bgworker 入口
 
 **文件**：`fdw/bgworker/auto_flush_worker.c`
 
@@ -446,7 +968,7 @@ PGDLLEXPORT void auto_flush_main(Datum arg) {
 
 **关键点**：`SPI_connect()` 后必须 `PushActiveSnapshot(GetTransactionSnapshot())`，否则报 `cannot execute SQL without an outer snapshot or portal`。
 
-### 5.3 注册
+### 5.4 注册
 
 **文件**：`fdw/hooks/fdw_hooks.c`，在 `_PG_init()` 中：
 
@@ -465,7 +987,7 @@ if (!IsUnderPostmaster) {
 }
 ```
 
-### 5.4 调用链路
+### 5.5 调用链路
 
 ```
 ═══════════════════════════════════════════════════════════════
@@ -500,7 +1022,7 @@ bgworker: SELECT public.iceberg_flush_worker('')
         → trg_last_flush_at → UPDATE tables.last_flush_at
 ```
 
-### 5.5 涉及文件明细
+### 5.6 涉及文件明细
 
 | 文件 | 函数/代码 | 作用 |
 |------|----------|------|
@@ -513,7 +1035,7 @@ bgworker: SELECT public.iceberg_flush_worker('')
 | `sql/02b-ddl.sql:44` | `iceberg_build_object()` | 重建 VIEW + 触发器 |
 | `Makefile:151` | `OBJS += fdw/bgworker/auto_flush_worker.o` | 编译链接 |
 
-### 5.6 变量清单
+### 5.7 变量清单
 
 #### C 层（bgworker）
 
@@ -534,7 +1056,7 @@ bgworker: SELECT public.iceberg_flush_worker('')
 | `delta_n` | bigint | scheduler | delta 行数 |
 | `jid` | bigint | scheduler | `iceberg_flush()` 返回值 |
 
-### 5.7 GUC 配置
+### 5.8 GUC 配置
 
 | GUC | 类型 | 默认值 | 含义 |
 |-----|------|--------|------|
